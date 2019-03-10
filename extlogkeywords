@@ -1,0 +1,479 @@
+#!/usr/bin/env ruby
+
+### extlogkeywords --- Utility for getting search keywords from web log files.
+## Copyright 2008 by Dave Pearson <http://www.davep.org/>
+## $Revision: 1.7 $
+##
+## extlogkeywords is free software distributed under the terms of the GNU
+## General Public Licence, version 2. For details see the file COPYING.
+
+# Quick, dirty and very simplistic weblog search term analysis tool. Needs a
+# fair bit of work to be more generally useful (for example, it handles my
+# logs, it might not handle yours).
+
+# Stuff we require.
+require 'cgi'
+
+############################################################################
+# Class for reading an apache log line.
+class ApacheLogLine
+
+  # Attributes
+  attr_reader :line
+  attr_reader :ip
+  attr_reader :time
+  attr_reader :request
+  attr_reader :status
+  attr_reader :size
+  attr_reader :referrer
+  attr_reader :browser
+
+  ##########################################################################
+  # Constructor.
+  def initialize( line )
+
+    # Save the line.
+    @line = line
+
+    # Try and pull the useful bits out of it.
+    if match = /^([\d\.]+) .*?\[(.*?)\] "(.*?)" (\d+) (.*?) "(.*?)"/.match( line )
+      @ip       = match[ 1 ]
+      @time     = match[ 2 ]
+      @request  = match[ 3 ]
+      @status   = match[ 4 ]
+      @size     = match[ 5 ]
+      @referrer = match[ 6 ]
+    end
+
+  end
+
+end
+
+############################################################################
+# Class for getting information about a seatrch engine query.
+class QueryString
+
+  # Attributes
+  attr_accessor :string
+
+  ##########################################################################
+  # Constructor.
+  def initialize( line )
+    if ( search = /[\?&]q=(.*?)[&\"]/.match( line.referrer ) )
+      @string = CGI::unescape( search[ 1 ] ).downcase.strip.gsub( /^cache:.+? /, "" )
+    end
+  end
+
+  ##########################################################################
+  # Is there a query in this line?
+  def query?
+    @string != nil
+  end
+
+  ##########################################################################
+  # Get the words from the line.
+  def words
+    unless @words
+      @words = @string.gsub( /[,\"\\]/, "" ).gsub( /\+/, " " ).split.select do |word|
+        case word
+        # Ignore really common words.
+        when "a", "of", "the", "to", "or", "in", "is", "and", "for", "+", "on", "at", "!", "-"
+          false
+        # Ignore things that will generally be Google directives.
+        when /^-[a-z]+?:/
+          false
+        else
+          true
+        end
+      end.uniq
+    end
+    @words
+  end
+
+end
+
+############################################################################
+# Base report class.
+class Report
+
+  # Attributes
+  attr_accessor :min
+
+  ##########################################################################
+  # Constructor.
+  def initialize
+    @min = 0
+  end
+
+  ##########################################################################
+  # Consume a line from a log.
+  def consume( query )
+    puts query.string
+  end
+
+  ##########################################################################
+  # Emit the report.
+  def emit
+    # GNDN
+  end
+
+end
+
+############################################################################
+# Like the base report but with a cleaned-up query.
+class ReportWords < Report
+
+  ##########################################################################
+  # Consume a line from a log.
+  def consume( query )
+    puts query.words.join( " " )
+  end
+
+end
+
+############################################################################
+# Report that produces a sorted table of phrases.
+class QueryTableReport < Report
+
+  ##########################################################################
+  # Constructor.
+  def initialize
+    super
+    @phrases = Hash.new( 0 )
+  end
+
+  ##########################################################################
+  # Consume a line from a log.
+  def consume( query )
+    @phrases[ query.string ] += 1
+  end
+
+  ##########################################################################
+  # Emit the report.
+  def emit
+    @phrases.sort() {|a,b| b[ 1 ] <=> a[ 1 ] }.each do |phrase|
+      if phrase[ 1 ] >= @min
+        puts "#{phrase[ 0 ].ljust( 60 )}#{phrase[ 1 ].to_s.rjust( 10 )}"
+      end
+    end
+  end
+
+end
+
+############################################################################
+# Report that produces a sorted table of cleaned phrases.
+class CleanQueryTableReport < Report
+
+  ##########################################################################
+  # Constructor.
+  def initialize
+    super
+    @phrases = Hash.new( 0 )
+  end
+
+  ##########################################################################
+  # Consume a line from a log.
+  def consume( query )
+    @phrases[ query.words.join( " " ) ] += 1
+  end
+
+  ##########################################################################
+  # Emit the report.
+  def emit
+    @phrases.sort() {|a,b| b[ 1 ] <=> a[ 1 ] }.each do |phrase|
+      if phrase[ 1 ] >= @min
+        puts "#{phrase[ 0 ].ljust( 60 )}#{phrase[ 1 ].to_s.rjust( 10 )}"
+      end
+    end
+  end
+
+end
+
+############################################################################
+# Report that produces a sorted table of words.
+class WordTableReport < Report
+
+  ##########################################################################
+  # Constructor.
+  def initialize
+    super
+    @words = Hash.new( 0 )
+  end
+
+  ##########################################################################
+  # Consume a line from a log.
+  def consume( query )
+    query.words.each {|word| @words[ word ] += 1 }
+  end
+
+  ##########################################################################
+  # Emit the report.
+  def emit
+    @words.sort() {|a,b| b[ 1 ] <=> a[ 1 ] }.each do |word|
+      if word[ 1 ] >= @min
+        puts "#{word[ 0 ].ljust( 60 )}#{word[ 1 ].to_s.rjust( 10 )}"
+      end
+    end
+  end
+
+end
+
+############################################################################
+# Report that produces a "word graph"
+class GraphReport < Report
+
+  ############################################################################
+  # Holds the details of a single word.
+  class Word
+
+    # Attributes
+    attr_reader :word
+    attr_reader :count
+
+    ##########################################################################
+    # Constructor.
+    def initialize( word )
+      @word  = word
+      @count = 0
+    end
+
+    ##########################################################################
+    # Increase the count.
+    def inc!
+      @count += 1
+    end
+
+  end
+
+  ############################################################################
+  # Holds the details of a word with its relationships.
+  class RelatedWords < Word
+
+    # Attributes
+    attr_reader :related
+
+    ##########################################################################
+    # Constructor.
+    def initialize( word )
+      super
+      @related = Hash.new {|hash,key| hash[ key ] = Word.new( key ) }
+    end
+
+    ##########################################################################
+    # Add a related word.
+    def <<( word )
+      @related[ word ].inc!
+    end
+
+  end
+
+  ############################################################################
+  # Constructor.
+  def initialize
+    super
+    @graph = Hash.new {|hash,key| hash[ key ] = RelatedWords.new( key ) }
+  end
+
+  ##########################################################################
+  # Consume a line from a log.
+  def consume( query )
+    query.words.each do |word|
+      @graph[ word ].inc!
+      ( query.words - [ word ] ).each {|other| @graph[ word ] << other }
+    end
+  end
+
+  ##########################################################################
+  # Emit the report.
+  def emit
+    @graph.sort {|k1,k2|
+      k2[ 1 ].count <=> k1[ 1 ].count
+    }.each do |word,value|
+      puts "#{word} (#{value.count})"
+      value.related.sort {|k1,k2|
+        k2[ 1 ].count <=> k1[ 1 ].count
+      }.each do |word,value|
+        puts "\t#{word} (#{value.count})"
+      end
+    end
+  end
+
+end
+
+############################################################################
+# Report that produces a "word graph" in a form that can be used with
+# the GraphViz tools.
+class DotGraph < GraphReport
+
+  # Attributes
+  attr_accessor :linked_only
+  attr_accessor :url
+  attr_accessor :with_counts
+
+  ##########################################################################
+  # Emit the report.
+  def emit
+
+    # Figure out the colour step.
+    colour_step = 128 / @graph.to_a.inject( 0 ) do |n,word|
+      [ n, word[ 1 ].count ].max
+    end
+
+    # Start of data.
+    puts "graph {"
+
+    # For each word in the main list....
+    @graph.each do |word,value|
+
+      # If its count is more than the required min...
+      if value.count >= @min
+
+        # Check if we're ignoring non-linked words.
+        unless @linked_only and value.related.empty?
+
+          # Sort out the label.
+          if @with_counts
+            label = "label=\"#{word}\\n(#{value.count})\" "
+          else
+            label = ""
+          end
+
+          # Sort out the URL.
+          if @url
+            url = " URL=\"#{@url}\" target=\"_blank\"" % word
+          else
+            url = ""
+          end
+
+          # Configure the node.
+          puts "\t\"#{word}\" [#{label}style=\"filled\" fillcolor=\"#0000#{( 127 + ( value.count * colour_step ) ).to_s( 16 )}\" fontcolor=\"white\"#{url}];"
+
+          # For each related word...
+          value.related.each do |related,related_value|
+            # Emit the connection (with duplicate protection)
+            if word > related and related_value.count >= @min
+              puts "\t\"#{word}\" -- \"#{related}\";"
+            end
+          end
+
+        end
+
+      end
+
+    end
+
+    # End of data.
+    puts "}"
+
+  end
+
+end
+
+############################################################################
+# Main utility code.
+
+if $0 == __FILE__
+
+  # We're going to use long options.
+  require "getoptlong"
+
+  # Set the default parameters.
+  $params = {
+    :dot_linked_only => false,
+    :dot_url         => "",
+    :dot_with_counts => false,
+    :emit            => "querytable",
+    :help            => false,
+    :min             => 0
+  }
+
+  # Print the help screen.
+  def printHelp
+    print "extlogkeywords v#{/(\d+\.\d+)/.match( '$Revision: 1.7 $' )[ 1 ]}
+Copyright 2008 by Dave Pearson <davep@davep.org>
+http://www.davep.org/
+
+Supported command line options:
+
+  -e --emit <report>       Specify the type of report to emit.
+                           See \"Supported reports\" below.
+  -m --min <value>         Specify the minimum count to include in
+                           a report (where appropriate).
+
+Command line options related to dot file output:
+
+  --dot-with-counts        Display counts in nodes.
+  --dot-url                Associate URL with nodes.
+                           This is a format string. Use %s where you
+                           want the node name to appear in the URL.
+  --dot-linked-only        Only include words that are related to
+                           other words.
+
+Supported reports:
+
+  Name             Short  Description
+  ==========       =====  ===============================================
+  queries          q      Simply lists every query found.
+  words            w      Simply lists all words found.
+  querytable       qt     Sorted table of queries found, with counts.
+  cleanquerytable  cqt    As above, but cleaned up a little.
+  wordtable        wt     Sorted table of words found, with counts.
+  graph            g      Graph data for all words found.
+  dot              d      Output that can be used with GraphViz.
+"
+  end
+
+  # Get the arguments from the command line.
+  begin
+    GetoptLong.new().set_options(
+                                 [ "--emit", "-e",      GetoptLong::REQUIRED_ARGUMENT ],
+                                 [ "--help", "-h",      GetoptLong::NO_ARGUMENT       ],
+                                 [ "--dot-with-counts", GetoptLong::NO_ARGUMENT       ],
+                                 [ "--dot-url",         GetoptLong::REQUIRED_ARGUMENT ],
+                                 [ "--dot-linked-only", GetoptLong::NO_ARGUMENT       ],
+                                 [ "--min",  "-m",      GetoptLong::REQUIRED_ARGUMENT ]
+                                 ).each {|name, value| $params[ name.gsub( /^--/, "" ).gsub( /-/, "_" ).intern ] = value }
+  rescue GetoptLong::Error
+    printHelp()
+    exit 1
+  end
+
+  # User wants help?
+  if $params[ :help ]
+    printHelp()
+    exit 0
+  end
+
+  # Create the reporting object.
+  case $params[ :emit ]
+  when "queries", "q"           then report = Report.new
+  when "words", "w"             then report = ReportWords.new
+  when "querytable", "qt"       then report = QueryTableReport.new
+  when "cleanquerytable", "cqt" then report = CleanQueryTableReport.new
+  when "wordtable", "wt"        then report = WordTableReport.new
+  when "graph", "g"             then report = GraphReport.new
+  when "dot", "d"
+    report             = DotGraph.new
+    report.with_counts = $params[ :dot_with_counts ]
+    report.linked_only = $params[ :dot_linked_only ]
+    report.url         = $params[ :dot_url ]
+  else
+    raise RuntimeError.new(), "Unknown report type '#{$params[ :emit ]}'"
+  end
+
+  # Set the min count.
+  report.min = $params[ :min ].to_i
+
+  # Consume every line on stdin.
+  $stdin.each do |line|
+    if ( search = QueryString.new( ApacheLogLine.new( line ) ) ).query?
+      report.consume( search )
+    end
+  end
+
+  # Emit the report.
+  report.emit
+
+end
+
+### extlogkeywords ends here
